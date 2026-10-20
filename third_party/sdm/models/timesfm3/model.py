@@ -1,0 +1,318 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ruff: noqa: D205
+
+from __future__ import annotations
+
+import math
+from itertools import product
+from typing import Any, ClassVar, cast
+
+import torch
+from torch import Tensor
+
+from sdm import Recipe, RelatedTables, Stype, TableTensor, Task
+from sdm.cache import Cache
+from sdm.models._huggingface import download_checkpoint
+from sdm.models.base import ICLModel
+from sdm.models.timesfm3.block import ResidualBlock
+from sdm.models.timesfm3.ckpt import remap_ckpt
+from sdm.models.timesfm3.icl import ICLBlock
+from sdm.models.timesfm3.recipe import default_recipe
+from sdm.models.timesfm3.util import (
+    crossfade_patches,
+    gather_future_patches,
+    get_running_stats,
+    revin,
+)
+from sdm.tensor.table import TableSchema
+
+
+class TimesFM3(ICLModel):
+    r"""The multivariate forecasting foundation model from `"TimesFM-3: A
+    Zero-shot Foundation Model for Multivariate Forecasting"
+    <https://research.google/blog/
+    timesfm-3-a-zero-shot-foundation-model-for-multivariate-forecasting>`__.
+
+    .. figure:: /images/timesfm3_light.png
+        :figclass: light-only
+        :width: 100%
+
+    .. figure:: /images/timesfm3_dark.png
+        :figclass: dark-only
+        :width: 100%
+
+    :class:`TimesFM3` is a zero-shot time-series foundation model for
+    multivariate forecasting. It extends earlier univariate TimesFM models with
+    native support for jointly forecasting multiple coevolving target series,
+    incorporating historical covariates, and using dynamic covariates that are
+    known across both the past and future forecast horizon.
+
+    Architecturally, it combines patch-based time-series tokenization with
+    alternating causal temporal attention and full variate attention, allowing
+    forecasts to use both within-series history and cross-series dependencies.
+    It decodes the full forecast horizon in a single forward pass and returns
+    nine quantile forecasts, from the 10th to the 90th percentile, for each
+    target series and query time step.
+
+    Within the :class:`~sdm.models.ICLModel` protocol, :class:`TimesFM3`
+    treats rows as ordered time steps. In a default forward pass,
+    ``x_context`` contains historical covariates, ``y_context`` contains one or
+    more past target series, and ``x_query`` contains future-known covariates
+    (which must also be present in ``x_context``).
+
+    .. note::
+        :class:`TimesFM` model weights are distributed under the
+        `TimesFM Non-Commercial License v1.0 <https://huggingface.co/google/
+        timesfm-3.0-pytorch/blob/main/LICENSE>`__.
+        Before downloading pretrained weights, users must accept the license
+        either interactively when prompted or explicitly via
+        ``accept_license=True``.
+
+    Args:
+        pretrained: Whether to load the pretrained checkpoint.
+        accept_license: Whether to accept the `TimesFM Non-Commercial License
+            v1.0 <https://huggingface.co/google/timesfm-3.0-pytorch/blob/main/
+            LICENSE>`__ without showing the interactive license prompt.
+        device: The device.
+    """
+
+    supported_feature_stypes: ClassVar[frozenset[Stype]] = frozenset(
+        {Stype.numerical}
+    )
+    supported_target_stypes: ClassVar[frozenset[Stype]] = frozenset(
+        {Stype.numerical}
+    )
+    supports_multi_target: ClassVar[bool] = True
+    supports_context_only_columns: ClassVar[bool] = True
+    supports_related_tables: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        pretrained: bool = True,
+        accept_license: bool = False,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__(task=Task.regression)
+
+        self.model = _TimesFM3(
+            device="meta" if pretrained else device,
+        )
+
+        if pretrained:
+            self._load_from_pretrained(accept_license, device=device)
+
+        self.eval()
+
+    @classmethod
+    def default_recipe(cls) -> Recipe:
+        r""":meta private:"""  # noqa: D415
+        return default_recipe()
+
+    def _load_from_pretrained(
+        self,
+        accept_license: bool,
+        device: torch.device | str | None,
+    ) -> TimesFM3:
+        from safetensors.torch import load_file  # noqa: PLC0415
+
+        TIMESFM_LICENSE_PROMPT = (
+            "TimesFM 3.0 pretrained weights are distributed under the TimesFM "
+            "Non-Commercial License v1.0 and may be used only for "
+            "non-commercial, non-production purposes. Review the license at "
+            "'https://huggingface.co/google/timesfm-3.0-pytorch/blob/main/"
+            "LICENSE' before downloading."
+        )
+
+        device = torch.get_default_device() if device is None else device
+
+        path = download_checkpoint(
+            repo_id="google/timesfm-3.0-pytorch",
+            filename="model.safetensors",
+            license_prompt=None if accept_license else TIMESFM_LICENSE_PROMPT,
+        )
+        ckpt = load_file(path, device=str(device))
+        ckpt = remap_ckpt(ckpt)
+        self.model.load_state_dict(ckpt, assign=True)
+
+        return self
+
+    def _forward(
+        self,
+        x_context: TableTensor | None,  # [..., R_context, D]
+        y_context: TableTensor | None,  # [..., R_context, Y]
+        x_query: TableTensor | None,  # [..., R_query, D]
+        x_context_only: TableTensor | None,  # [..., R_context, D_only]
+        related_context_tables: RelatedTables[TableTensor] | None,
+        related_query_tables: RelatedTables[TableTensor] | None,
+        cache: Cache | None,
+        generator: torch.Generator | None,
+        **kwargs: Any,
+    ) -> TableTensor:  # [..., R_query, Y * 9]
+
+        if cache is None or cache.is_recording:
+            assert x_context is not None
+            x_context: Tensor = x_context.numerical
+            assert y_context is not None
+            y = y_context.numerical
+            if x_context_only is not None:
+                x_context_only: Tensor = x_context_only.numerical
+            else:
+                x_context_only: Tensor = y.new_empty((*y.size()[:-1], 0))
+            y_schema = y_context.schema
+        else:
+            x_context: Tensor = cast(Tensor, cache["x_context"])
+            y = cast(Tensor, cache["y"])
+            x_context_only: Tensor = cast(Tensor, cache["x_context_only"])
+            y_schema = cast(TableSchema, cache["y_schema"])
+
+        if cache is not None and cache.is_recording:
+            cache["x_context"] = x_context
+            cache["x_context_only"] = x_context_only
+            cache["y"] = y
+
+        if x_query is None:
+            out = y.new_empty((*y.size()[:-2], 0, y.size(-1) * 9))
+        else:
+            out = self.model(
+                x_context=x_context,
+                x_query=x_query.numerical,
+                x_context_only=x_context_only,
+                y=y,
+            ).flatten(-2)  # [..., R_query, Y * 9]
+
+        return TableTensor(
+            columns={
+                Stype.numerical: [
+                    f"{name}__q{i}"
+                    for name, i in product(
+                        y_schema.columns[Stype.numerical],
+                        range(10, 100, 10),
+                    )
+                ]
+            },
+            numerical=out,
+        )
+
+
+class _TimesFM3(torch.nn.Module):
+    def __init__(
+        self,
+        input_patch_size: int = 32,
+        output_patch_size: int = 64,
+        num_quantiles: int = 9,
+        channels: int = 1280,
+        num_layers: int = 20,
+        num_heads: int = 16,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
+
+        assert output_patch_size % input_patch_size == 0
+        self.input_patch_size = input_patch_size
+        self.output_patch_size = output_patch_size
+
+        self.patch_embedding = ResidualBlock(
+            in_channels=2 * (input_patch_size + output_patch_size),
+            out_channels=channels,
+            **factory_kwargs,
+        )
+        self.icl_block = ICLBlock(
+            channels=channels,
+            out_channels=output_patch_size * num_quantiles,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            **factory_kwargs,
+        )
+
+    def forward(
+        self,
+        x_context: Tensor,  # [..., R_train, C]
+        x_query: Tensor,  # [..., R_test, C]
+        x_context_only: Tensor,  # [..., R_train, *]
+        y: Tensor,  # [..., R_train, *]
+    ) -> Tensor:  # [..., R_test, Y, num_quantiles]
+
+        *B, R_test, C = x_query.size()
+        *_, R_train, C_only = x_context_only.size()
+        P = self.input_patch_size
+        O = self.output_patch_size  # noqa E741
+        horizon = R_test + (-R_test % O) if C == 0 else R_test
+
+        # Create patched input tensor:
+        left_pad = -R_train % P
+        mid = left_pad + R_train
+        right_pad = horizon - R_test + (-horizon % P)
+
+        x = x_context.new_full(
+            (
+                *B,
+                x_query.size(-1) + x_context_only.size(-1) + y.size(-1),
+                left_pad + R_train + R_test + right_pad,
+            ),
+            fill_value=torch.nan,
+        )
+        x[..., :C, left_pad:mid] = x_context.transpose(-2, -1)
+        x[..., C : C + C_only, left_pad:mid] = x_context_only.transpose(-2, -1)
+        x[..., C + C_only :, left_pad:mid] = y.transpose(-2, -1)
+        x[..., :C, mid : mid + R_test] = x_query.transpose(-2, -1)
+        x = x.unflatten(-1, (-1, P))  # [..., C, N, P]
+
+        # Gather future patches and normalize:
+        mask = x.isnan()
+        x[mask] = 0.0
+        _, mean, std = get_running_stats(x, mask)
+
+        future_x, past_end = gather_future_patches(x, num_patches=O // P)
+        future_mask, _ = gather_future_patches(mask, num_patches=O // P)
+        future_mask |= past_end
+        # Exclude future information for context only features and targets:
+        future_mask[..., C:, :, :] = True
+
+        x = revin(x, mean, std)
+        future_x = revin(future_x, mean, std)
+        x[mask] = 0.0
+        future_x[future_mask] = 0.0
+        x = torch.cat(
+            [x, future_x, mask.to(x.dtype), future_mask.to(x.dtype)],
+            dim=-1,
+        )  # [..., C, N, *]
+
+        # Run the model (assume no empty leading patches):
+        x = self.patch_embedding(x)  # [..., C, N, D]
+        out = self.icl_block(x)  # [..., C, N, O * Q]
+        out = out.unflatten(-1, (self.output_patch_size, -1))
+        out = revin(out, mean, std, reverse=True)
+
+        # Narrow target output patches:
+        first = mid // P - 1
+        overlap = min(2 * P, O) - P
+        num_readouts = max(math.ceil((horizon - overlap) / P), 1)
+        out = out[
+            ...,
+            C + C_only :,
+            first : first + num_readouts,
+            : min(2 * P, O),
+            :,
+        ]
+
+        # Stitch overlapping predictions together:
+        out = crossfade_patches(out, step=P, dim=-3)
+        return out[..., :R_test, :].transpose(-3, -2)  # [..., R_test, *, Q]

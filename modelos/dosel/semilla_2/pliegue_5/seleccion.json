@@ -1,0 +1,32 @@
+{
+ "candidato": "candidate_020",
+ "regla": "MAE en validacion interna",
+ "configuracion": {
+  "id": "candidate_020",
+  "kind": "direct_attention_correction",
+  "municipal_backbone": "municipal_lr_1e4",
+  "daily_recipe": "current_anomaly_18_huber",
+  "config": {
+   "architecture": "attention_moe",
+   "feature_keys": [
+    "municipal_mmst",
+    "daily",
+    "daily_delta"
+   ],
+   "anchor_keys": [
+    "baseline_anchor"
+   ],
+   "width": 16,
+   "num_heads": 2,
+   "experts": 4,
+   "epochs": 18,
+   "dropout": 0.3,
+   "weight_decay": 0.1,
+   "learning_rate": 0.0003,
+   "batch_size": 8,
+   "threads": 2,
+   "loss": "l1",
+   "huber_delta": 1.0
+  }
+ }
+}

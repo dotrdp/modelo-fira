@@ -1,0 +1,73 @@
+{
+ "kernel": "tm^2 [mismo municipio] + ts^2 [mismo estado] + sf^2 exp(-d/ell) + sn^2 I (d en metros, UTM 14N)",
+ "tm": 0.7,
+ "ts": 0.0,
+ "sf": 0.5,
+ "ell": 250,
+ "sn": 0.15,
+ "media": [
+  "intercepto",
+  "log(area_ha) estandarizado",
+  "N2 estandarizado",
+  "N3 estandarizado"
+ ],
+ "estandarizacion": "media y desviacion estandar (ddof=0) sobre las parcelas de entrenamiento del modelo",
+ "pliegues": [
+  {
+   "tm": 0.7,
+   "ts": 0.0,
+   "sf": 0.5,
+   "ell": 250,
+   "sn": 0.15,
+   "pliegue": 1
+  },
+  {
+   "tm": 0.7,
+   "ts": 0.5,
+   "sf": 0.5,
+   "ell": 250,
+   "sn": 0.15,
+   "pliegue": 2
+  },
+  {
+   "tm": 0.7,
+   "ts": 0.0,
+   "sf": 0.5,
+   "ell": 250,
+   "sn": 0.15,
+   "pliegue": 3
+  },
+  {
+   "tm": 0.7,
+   "ts": 0.0,
+   "sf": 0.35,
+   "ell": 500,
+   "sn": 0.35,
+   "pliegue": 4
+  },
+  {
+   "tm": 0.7,
+   "ts": 0.0,
+   "sf": 0.35,
+   "ell": 250,
+   "sn": 0.25,
+   "pliegue": 5
+  }
+ ],
+ "uso": "prediccion = media de los 5 modelos de pliegue (solo intercepto y log-area) + [modelo de las 138 con N2 y N3 - modelo de las 138 sin ellos]",
+ "columnas_media": [
+  {
+   "family": "N2",
+   "kind": "pooled_within",
+   "column": "s2_ndvi__cal__bak__b",
+   "spearman": 0.27053475240812846
+  },
+  {
+   "family": "N3",
+   "kind": "muni_slope",
+   "column": "mtci_grain_fill",
+   "municipality": "Singuilucan",
+   "spearman": 0.7764798976317863
+  }
+ ]
+}

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+predicciones.csv
+DATASET_RETO_AGRO_2026/
