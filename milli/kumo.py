@@ -54,9 +54,13 @@ def predecir(y, ids_pred, dispositivo="auto"):
         k = f["pliegue"]
         tr = np.sort(np.array([pos[i] for i in f["ids_entrenamiento"]]))
         tabla = _tabla(sdm, d, y.loc[[ids[i] for i in tr]].to_numpy(np.float32), tr, dev)
-        estado = torch.load(RAIZ / f"modelos/kumo/pliegue_{k}.pt", weights_only=True, map_location="cpu")
+        # Cada modelo está guardado en dos partes (GitHub no acepta archivos de más de 100 MB).
+        pesos = {}
+        for parte in (1, 2):
+            pesos.update(torch.load(RAIZ / f"modelos/kumo/pliegue_{k}_parte{parte}.pt", weights_only=True,
+                                    map_location="cpu")["state_dict"])
         modelo = sdm.models.KumoTabular(task="regression", size="small", pretrained=False, device=dev)
-        modelo.load_state_dict(estado["state_dict"], strict=True)
+        modelo.load_state_dict(pesos, strict=True)
         modelo.eval()
         semilla = SEMILLA_PLAN + 100 * k
         torch.manual_seed(semilla)
